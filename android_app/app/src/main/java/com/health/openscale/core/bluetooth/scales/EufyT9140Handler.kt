@@ -18,9 +18,8 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Protocol from bdr99/eufylife-ble-client (MIT, © bdr99) and particleflux's 2021
  * reverse-engineering notes; see [EufyT9140Lib] for the wire format and credits.
- * NOTE: the GATT wiring (service/characteristic choice, write-without-response, command
- * pacing) has not been verified on hardware yet — the parser and command framing are
- * covered by EufyT9140LibTest.
+ * The weight path is confirmed on hardware; the history read that supplies body
+ * composition is covered by EufyT9140LibTest but has not been exercised on a scale yet.
  */
 package com.health.openscale.core.bluetooth.scales
 
@@ -37,9 +36,13 @@ import com.health.openscale.core.data.Ohm
 import com.health.openscale.core.data.Percent
 import com.health.openscale.core.data.WeightUnit
 import com.health.openscale.core.service.ScannedDeviceInfo
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.abs
 
 /**
  * Eufy Smart Scale T9140.
@@ -48,9 +51,15 @@ import java.util.UUID
  * (some firmware `4143f7b0-…`, fallback `0000fff0-…`), notifications on `…b2`, writes on
  * `…b1`. No pairing and no encryption, unlike the P2/P2 Pro — see [EufyT9140Lib].
  *
- * A weigh-in arrives as a settled `AC 02 <weight> <impedance> CA` frame. The scale also sends
- * intermediate `…CE` frames while the weight is still moving; those are logged but not saved,
- * because openScale stores one row per weigh-in.
+ * A weigh-in arrives as a settled `AC 02 <weight> <impedance> CA` frame, with the impedance field
+ * left at zero: this model finishes the BIA run after the weight settles and keeps the result in
+ * its own history instead of pushing it. The driver therefore reads the history after a settle (and
+ * on connect) and saves the record — weight *and* impedance — as one measurement. A weight-only
+ * frame is held for [LIVE_GRACE_MS] first, so one weigh-in produces one complete row rather than a
+ * weight-only row followed by a duplicate.
+ *
+ * Intermediate `…CE` frames while the weight is still moving are logged but not saved, because
+ * openScale stores one row per weigh-in.
  */
 class EufyT9140Handler : ScaleDeviceHandler() {
 
@@ -75,6 +84,13 @@ class EufyT9140Handler : ScaleDeviceHandler() {
 
     private var publishedThisSession = false
 
+    /** Weight of a settled frame whose row is waiting for its body-composition record, or 0. */
+    private var heldWeightKg = 0f
+    private var heldJob: Job? = null
+
+    /** Records already handled in this connection, by their own timestamp. */
+    private val seenEpochs = mutableSetOf<Long>()
+
     override fun supportFor(device: ScannedDeviceInfo): DeviceSupport? {
         val name = device.name.lowercase(Locale.ROOT)
         if (!name.contains("t9140") && !name.contains("bodysense")) return null
@@ -89,9 +105,7 @@ class EufyT9140Handler : ScaleDeviceHandler() {
         return DeviceSupport(
             displayName = "Eufy Smart Scale (T9140)",
             capabilities = caps,
-            // History read is understood (see EufyT9140Lib.historyRequestCommand) but the record
-            // parser is not written yet; live weigh-ins are what this driver is for.
-            implemented = caps - DeviceCapability.HISTORY_READ,
+            implemented = caps,
             tuningProfile = TuningProfile.Conservative, // Eufy firmware dislikes back-to-back writes
             linkMode = LinkMode.CONNECT_GATT
         )
@@ -103,6 +117,10 @@ class EufyT9140Handler : ScaleDeviceHandler() {
         service = null
         notifyChar = null
         writeChar = null
+        heldWeightKg = 0f
+        heldJob?.cancel()
+        heldJob = null
+        seenEpochs.clear()
 
         val candidates = listOf(
             Triple(serviceBody, notifyBody, writeBody),
@@ -138,6 +156,13 @@ class EufyT9140Handler : ScaleDeviceHandler() {
             withResponse = false
         )
 
+        // The impedance of a weigh-in only exists in the scale's history, so ask for it once the
+        // configuration writes have gone out. Records openScale already has are filtered on arrival.
+        scope.launch {
+            delay(HISTORY_REQUEST_DELAY_MS)
+            requestHistory()
+        }
+
         userInfo(R.string.bt_info_step_on_scale)
     }
 
@@ -153,42 +178,147 @@ class EufyT9140Handler : ScaleDeviceHandler() {
         // wrapper, and this line is what makes a user-submitted log diagnosable.
         logD("T9140 ← ${EufyT9140Lib.toHex(data)}")
 
+        // History records are longer than the 16/17-byte container the live frames use, so they are
+        // read before anything splits the notification.
+        if (EufyT9140Lib.isHistoryStart(data)) {
+            logD("T9140: history transfer started")
+            return
+        }
+        val records = EufyT9140Lib.parseHistoryRecords(data)
+        if (records.isNotEmpty()) {
+            records.forEach { onHistoryRecord(it, user) }
+            return
+        }
+
         for (frame in EufyT9140Lib.splitFrames(data)) {
-            val reading = EufyT9140Lib.parseReading(frame)
-            if (reading == null) {
-                logD("T9140: not a weigh-in frame (${EufyT9140Lib.toHex(frame)})")
-                continue
-            }
-            if (!reading.isFinal) {
-                logD("T9140: interim ${reading.weightKg} kg")
-                continue
-            }
-            if (publishedThisSession) {
-                logD("T9140: settled reading already saved this session, ignoring repeat")
-                continue
-            }
-            publish(buildMeasurement(reading, user))
-            publishedThisSession = true
+            onLiveFrame(frame, user)
         }
     }
 
     override fun onDisconnected() {
         publishedThisSession = false
+        heldJob?.cancel()
+        heldJob = null
+        heldWeightKg = 0f
     }
 
-    private fun buildMeasurement(reading: EufyT9140Lib.Reading, user: ScaleUser): ScaleMeasurement {
+    private fun requestHistory() {
+        val svc = service ?: return
+        val chr = writeChar ?: return
+        logD("T9140 → history request")
+        writeTo(svc, chr, EufyT9140Lib.historyRequestCommand(), withResponse = false)
+    }
+
+    // ── live weigh-ins ──────────────────────────────────────────────────────────
+
+    private fun onLiveFrame(frame: ByteArray, user: ScaleUser) {
+        val reading = EufyT9140Lib.parseReading(frame)
+        if (reading == null) {
+            logD("T9140: not a weigh-in frame (${EufyT9140Lib.toHex(frame)})")
+            return
+        }
+        if (!reading.isFinal) {
+            logD("T9140: interim ${reading.weightKg} kg")
+            return
+        }
+        if (publishedThisSession) {
+            logD("T9140: settled reading already saved this session, ignoring repeat")
+            return
+        }
+
+        // Some firmware puts the BIA result straight into the settled frame; take it when it does.
+        if (reading.impedanceOhm > 0) {
+            heldJob?.cancel()
+            heldJob = null
+            heldWeightKg = 0f
+            publish(buildMeasurement(reading.weightKg, reading.impedanceOhm, Date(), user))
+            publishedThisSession = true
+            return
+        }
+
+        // Otherwise hold the weight and give the scale a moment to store the record. If nothing
+        // arrives, the weight is saved on its own — losing a weigh-in is worse than losing its body
+        // composition.
+        heldWeightKg = reading.weightKg
+        heldJob?.cancel()
+        heldJob = scope.launch {
+            delay(LIVE_GRACE_MS)
+            if (publishedThisSession) return@launch
+            logI("T9140: no body-composition record within $LIVE_GRACE_MS ms — saving weight only")
+            publish(buildMeasurement(reading.weightKg, 0, Date(), user))
+            publishedThisSession = true
+        }
+
+        logD("T9140: settled ${reading.weightKg} kg, asking for history")
+        scope.launch {
+            delay(HISTORY_AFTER_SETTLE_DELAY_MS)
+            requestHistory()
+        }
+    }
+
+    // ── history records ─────────────────────────────────────────────────────────
+
+    private fun onHistoryRecord(record: EufyT9140Lib.HistoryRecord, user: ScaleUser) {
+        logI(
+            "T9140: history ${Date(record.epochSeconds * 1000L)} → " +
+                "${record.weightKg} kg, ${record.impedanceOhm} Ω"
+        )
+        if (!seenEpochs.add(record.epochSeconds)) {
+            logD("T9140: history record already handled in this session")
+            return
+        }
+
+        val matchesHeld = heldWeightKg > 0f && abs(record.weightKg - heldWeightKg) <= WEIGHT_TOLERANCE_KG
+        if (!matchesHeld && isAlreadySaved(record, user)) {
+            logD("T9140: history record matches a saved measurement, skipping")
+            return
+        }
+
+        if (matchesHeld) {
+            // This is the record for the weigh-in being held: one complete row, not two.
+            logI("T9140: history record covers the current weigh-in — saving weight and impedance")
+            heldJob?.cancel()
+            heldJob = null
+            heldWeightKg = 0f
+            publishedThisSession = true
+        }
+
+        publish(buildMeasurement(record.weightKg, record.impedanceOhm, Date(record.epochSeconds * 1000L), user))
+    }
+
+    /**
+     * True when [record] is a measurement openScale already has. Timestamps come from two clocks (the
+     * phone for live rows, the scale for records), so a match is "same weight, close in time" rather
+     * than an exact timestamp comparison.
+     */
+    private fun isAlreadySaved(record: EufyT9140Lib.HistoryRecord, user: ScaleUser): Boolean {
+        val last = lastMeasurementFor(user.id) ?: return false
+        val lastAt = last.dateTime?.time ?: return false
+        if (record.epochSeconds * 1000L > lastAt + DUPLICATE_WINDOW_MS) return false
+        val lastWeight = last[MeasurementType.WEIGHT]?.value ?: return false
+        return abs(record.weightKg - lastWeight) <= WEIGHT_TOLERANCE_KG
+    }
+
+    // ── measurement assembly ────────────────────────────────────────────────────
+
+    private fun buildMeasurement(
+        weightKg: Float,
+        impedanceOhm: Int,
+        at: Date,
+        user: ScaleUser
+    ): ScaleMeasurement {
         val m = ScaleMeasurement().apply {
             userId = user.id
-            dateTime = Date()
-            this[MeasurementType.WEIGHT] = Kg(reading.weightKg)
+            dateTime = at
+            this[MeasurementType.WEIGHT] = Kg(weightKg)
             // Stored even when body composition is skipped below, so it can be recomputed later.
-            if (reading.impedanceOhm > 0) {
-                this[MeasurementType.IMPEDANCE] = Ohm(reading.impedanceOhm.toFloat())
+            if (impedanceOhm > 0) {
+                this[MeasurementType.IMPEDANCE] = Ohm(impedanceOhm.toFloat())
             }
         }
 
-        if (reading.impedanceOhm <= 0) {
-            logI("T9140: no impedance in frame — saving weight only (%.2f kg)".format(reading.weightKg))
+        if (impedanceOhm <= 0) {
+            logI("T9140: no impedance for this weigh-in — saving weight only ($weightKg kg)")
             return m
         }
         if (user.bodyHeight <= 0f) {
@@ -204,15 +334,14 @@ class EufyT9140Handler : ScaleDeviceHandler() {
                 user.bodyHeight,
                 peopleType(user.activityLevel)
             )
-            val fat = lib.getBodyFat(reading.weightKg, reading.impedanceOhm.toFloat())
+            val fat = lib.getBodyFat(weightKg, impedanceOhm.toFloat())
             m[MeasurementType.BODY_FAT] = Percent(fat)
             m[MeasurementType.WATER] = Percent(lib.getWater(fat))
-            m[MeasurementType.BONE] = Kg(lib.getBoneMass(reading.weightKg, reading.impedanceOhm.toFloat()))
-            m[MeasurementType.VISCERAL_FAT] = lib.getVisceralFat(reading.weightKg)
-            m[MeasurementType.MUSCLE] =
-                Percent(lib.getMuscle(reading.weightKg, reading.impedanceOhm.toFloat()))
+            m[MeasurementType.BONE] = Kg(lib.getBoneMass(weightKg, impedanceOhm.toFloat()))
+            m[MeasurementType.VISCERAL_FAT] = lib.getVisceralFat(weightKg)
+            m[MeasurementType.MUSCLE] = Percent(lib.getMuscle(weightKg, impedanceOhm.toFloat()))
             m[MeasurementType.LBM] =
-                Kg(lib.getLBM(reading.weightKg, m[MeasurementType.BODY_FAT]?.value ?: 0f))
+                Kg(lib.getLBM(weightKg, m[MeasurementType.BODY_FAT]?.value ?: 0f))
         } catch (t: Throwable) {
             logW("T9140: body composition failed, saving weight and impedance: ${t.message}")
         }
@@ -232,5 +361,22 @@ class EufyT9140Handler : ScaleDeviceHandler() {
         ActivityLevel.MODERATE -> 1
         ActivityLevel.HEAVY -> 2
         ActivityLevel.EXTREME -> 2
+    }
+
+    private companion object {
+        /** How long a settled weight waits for its body-composition record before being saved bare. */
+        const val LIVE_GRACE_MS = 6_000L
+
+        /** Delay before the first history request, so the unit/clock writes go out alone. */
+        const val HISTORY_REQUEST_DELAY_MS = 800L
+
+        /** Settle → history request: the BIA run needs a moment after the weight stops moving. */
+        const val HISTORY_AFTER_SETTLE_DELAY_MS = 2_500L
+
+        /** Two rows are the same weigh-in when the weights are this close … */
+        const val WEIGHT_TOLERANCE_KG = 0.3f
+
+        /** … and the timestamps are within this window (the scale and the phone disagree slightly). */
+        const val DUPLICATE_WINDOW_MS = 15 * 60 * 1000L
     }
 }

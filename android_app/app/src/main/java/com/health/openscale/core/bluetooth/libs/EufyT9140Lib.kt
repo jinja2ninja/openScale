@@ -43,9 +43,14 @@ package com.health.openscale.core.bluetooth.libs
  *
  *     AC 02 <weight BE, 0.1 kg> <impedance BE, Ω> <CA = settled | CE = still moving>
  *
- * The same weight/impedance pair is what the scale stores in its history record
- * (`AC 02 FF <unix time BE> <weight> <impedance> …`), which is where these offsets were
- * confirmed.
+ * The impedance field of a live frame is 0 on this model: the BIA run finishes after the weight
+ * settles and the result is only written to the scale's own history. The stored record is where
+ * the real value lives:
+ *
+ *     AC 02 FF <unix time LE, 4 bytes> <weight BE, 0.1 kg> <impedance BE, Ω> <8 spare bytes>
+ *
+ * Both entries were confirmed against the scale's own history dump (72.3 kg / 568 Ω), which is
+ * also why the timestamp is decoded little endian while weight and impedance are big endian.
  *
  * Everything here is pure and covered by `EufyT9140LibTest`; the BLE wiring lives in
  * [com.health.openscale.core.bluetooth.scales.EufyT9140Handler].
@@ -54,6 +59,12 @@ object EufyT9140Lib {
 
     /** One decoded weigh-in frame. [impedanceOhm] is 0 when the scale did not measure it. */
     data class Reading(val weightKg: Float, val impedanceOhm: Int, val isFinal: Boolean)
+
+    /**
+     * One stored weigh-in from the scale's history. This is the only place the BIA impedance is
+     * available, so it is also the only source of body composition for this model.
+     */
+    data class HistoryRecord(val epochSeconds: Long, val weightKg: Float, val impedanceOhm: Int)
 
     /** Frame marker for a settled reading (the one worth saving). */
     const val MARKER_FINAL = 0xCA
@@ -69,6 +80,10 @@ object EufyT9140Lib {
 
     /** Plausible weight window in kg, used to reject frames that only look like a reading. */
     private val WEIGHT_RANGE = 2.0f..300.0f
+
+    /** Plausible history timestamps: 2000-01-01 .. 2100-01-01 in epoch seconds. */
+    private const val MIN_EPOCH = 946_684_800L
+    private const val MAX_EPOCH = 4_102_444_800L
 
     // ── framing ────────────────────────────────────────────────────────────────
 
@@ -115,8 +130,7 @@ object EufyT9140Lib {
 
     /**
      * Ask for the stored weigh-ins: `FF 00 00 00 CF`. The scale answers `AC 02 FE 01 00 00 CF CE`
-     * followed by records; the record parser is not implemented yet (see
-     * [com.health.openscale.core.bluetooth.scales.EufyT9140Handler]).
+     * (see [isHistoryStart]) followed by the records themselves (see [parseHistoryRecords]).
      */
     fun historyRequestCommand(): ByteArray =
         command(byteArrayOf(0xFF.toByte(), 0x00, 0x00, 0x00, 0xCF.toByte()))
@@ -141,6 +155,58 @@ object EufyT9140Lib {
             }
         }
         return listOf(data)
+    }
+
+    /** True for the history-response start marker `AC 02 FE 01 00 00 CF CE`. */
+    fun isHistoryStart(frame: ByteArray): Boolean =
+        frame.size >= 7 &&
+            (frame[0].toInt() and 0xFF) == PREFIX_A &&
+            (frame[1].toInt() and 0xFF) == PREFIX_B &&
+            (frame[2].toInt() and 0xFF) == 0xFE &&
+            (frame[3].toInt() and 0xFF) == 0x01
+
+    /**
+     * Decode the stored weigh-ins carried by one history notification.
+     *
+     * A record is `AC 02 FF` + 8 bytes of entry, and the 19-byte form the scale sends has room
+     * for a second entry in the tail — hence the two candidate offsets. Entries the scale left
+     * empty (all zero) are dropped, so an empty list means "not a history record".
+     */
+    fun parseHistoryRecords(frame: ByteArray): List<HistoryRecord> {
+        if (frame.size < 11) return emptyList()
+        if ((frame[0].toInt() and 0xFF) != PREFIX_A ||
+            (frame[1].toInt() and 0xFF) != PREFIX_B ||
+            (frame[2].toInt() and 0xFF) != 0xFF
+        ) {
+            return emptyList()
+        }
+        return listOfNotNull(decodeRecordAt(frame, 3), decodeRecordAt(frame, 11))
+    }
+
+    /**
+     * Decode one entry at [offset]: epoch seconds little endian, then weight big endian in 0.1 kg,
+     * then impedance big endian in ohms. A timestamp or weight outside the plausible window means
+     * the bytes are not an entry (the scale zero-fills unused space).
+     */
+    private fun decodeRecordAt(frame: ByteArray, offset: Int): HistoryRecord? {
+        if (frame.size < offset + 8) return null
+
+        var epochSeconds = 0L
+        for (i in 0 until 4) {
+            epochSeconds = epochSeconds or ((frame[offset + i].toLong() and 0xFF) shl (8 * i))
+        }
+        if (epochSeconds < MIN_EPOCH || epochSeconds > MAX_EPOCH) return null
+
+        val rawWeight =
+            ((frame[offset + 4].toInt() and 0xFF) shl 8) or (frame[offset + 5].toInt() and 0xFF)
+        val weightKg = rawWeight / 10.0f
+        if (weightKg !in WEIGHT_RANGE) return null
+
+        val rawImpedance =
+            ((frame[offset + 6].toInt() and 0xFF) shl 8) or (frame[offset + 7].toInt() and 0xFF)
+        val impedance = if (rawImpedance in IMPEDANCE_RANGE) rawImpedance else 0
+
+        return HistoryRecord(epochSeconds, weightKg, impedance)
     }
 
     /**
