@@ -106,6 +106,66 @@ class EufyT9140LibTest {
         assertThat(EufyT9140Lib.parseReading(hex("ac 02 00 01 02 38 ca"))).isNull()   // 0.1 kg
     }
 
+    // ── history records ─────────────────────────────────────────────────────────
+
+    @Test
+    fun `history start marker is recognised`() {
+        assertThat(EufyT9140Lib.isHistoryStart(hex("ac 02 fe 01 00 00 cf ce"))).isTrue()
+        // A settled weigh-in frame is not a history marker, despite sharing the prefix.
+        assertThat(EufyT9140Lib.isHistoryStart(hex("ac 02 02 d3 02 38 ca"))).isFalse()
+        assertThat(EufyT9140Lib.isHistoryStart(hex("ac 02"))).isFalse()
+    }
+
+    @Test
+    fun `history record decodes the scale's own sample`() {
+        // ac02 ff 1c2db260 02d3 0238 0000000000000000 — the record from particleflux's 2021 notes.
+        val records = EufyT9140Lib.parseHistoryRecords(hex("ac02ff1c2db26002d302380000000000000000"))
+
+        assertThat(records).hasSize(1)
+        val record = records[0]
+        // Timestamp is little endian: 0x60b22d1c = Sat 29 May 2021 12:01:32 UTC.
+        assertThat(record.epochSeconds).isEqualTo(1622289692L)
+        assertThat(record.weightKg).isWithin(0.001f).of(72.3f)
+        assertThat(record.impedanceOhm).isEqualTo(568)
+    }
+
+    @Test
+    fun `history record with two entries yields both`() {
+        // 19-byte form: entry at offset 3, spare space at offset 11 holding a second entry.
+        val frame = hex("ac02ff1c2db26002d30238" + "1d2db26002d4024a")
+
+        val records = EufyT9140Lib.parseHistoryRecords(frame)
+
+        assertThat(records).hasSize(2)
+        assertThat(records[0].weightKg).isWithin(0.001f).of(72.3f)
+        assertThat(records[1].epochSeconds).isEqualTo(1622289693L)
+        assertThat(records[1].weightKg).isWithin(0.001f).of(72.4f)
+        assertThat(records[1].impedanceOhm).isEqualTo(586)
+    }
+
+    @Test
+    fun `zero filled history space is not a record`() {
+        assertThat(EufyT9140Lib.parseHistoryRecords(hex("ac02ff0000000000000000"))).isEmpty()
+        assertThat(EufyT9140Lib.parseHistoryRecords(hex("ac 02 ff 00"))).isEmpty()
+    }
+
+    @Test
+    fun `a weigh-in without a BIA result keeps the weight`() {
+        val records = EufyT9140Lib.parseHistoryRecords(hex("ac02ff1c2db26002d3000000000000000000"))
+
+        assertThat(records).hasSize(1)
+        assertThat(records[0].weightKg).isWithin(0.001f).of(72.3f)
+        assertThat(records[0].impedanceOhm).isEqualTo(0)
+    }
+
+    @Test
+    fun `a history record is not mistaken for a live frame`() {
+        val record = hex("ac02ff1c2db26002d302380000000000000000")
+
+        assertThat(EufyT9140Lib.parseReading(record)).isNull()
+        assertThat(EufyT9140Lib.splitFrames(record)).hasSize(1)
+    }
+
     // ── container splitting ─────────────────────────────────────────────────────
 
     @Test
